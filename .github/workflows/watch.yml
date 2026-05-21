@@ -15,6 +15,10 @@ on:
         description: "Don't save state, don't send email"
         required: false
         default: "false"
+      force:
+        description: "Override safety guards (re-bootstrap over existing state, or send an email exceeding the new-listings cap)"
+        required: false
+        default: "false"
   schedule:
     - cron: '*/15 * * * *'
 
@@ -37,6 +41,7 @@ jobs:
       ALERT_TO:  ${{ secrets.ALERT_RECIPIENT }}
       BOOTSTRAP_FLAG: ${{ inputs.bootstrap == 'true' && '--bootstrap' || '' }}
       DRY_RUN_FLAG:   ${{ inputs.dry_run   == 'true' && '--dry-run'   || '' }}
+      FORCE_FLAG:     ${{ inputs.force     == 'true' && '--force'     || '' }}
     steps:
       - name: Checkout code (main)
         uses: actions/checkout@v4
@@ -63,13 +68,14 @@ jobs:
         run: |
           [ -n "$ALERT_TO" ] && echo "::add-mask::$ALERT_TO" || true
           [ -n "$SMTP_USER" ] && echo "::add-mask::$SMTP_USER" || true
+          [ -n "$SMTP_PASS" ] && echo "::add-mask::$SMTP_PASS" || true
 
       - name: Run watcher
         id: run
         continue-on-error: true
         working-directory: code
         run: |
-          python -m watcher --state-root "$GITHUB_WORKSPACE/state" $BOOTSTRAP_FLAG $DRY_RUN_FLAG
+          python -m watcher --state-root "$GITHUB_WORKSPACE/state" $BOOTSTRAP_FLAG $DRY_RUN_FLAG $FORCE_FLAG
 
       - name: Commit state
         if: steps.run.outcome == 'success' && inputs.dry_run != 'true'

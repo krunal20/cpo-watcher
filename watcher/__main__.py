@@ -8,11 +8,16 @@ Exit codes:
      ::warning:: annotation, but the run stays green because state was correctly
      persisted with the failed dealers' VINs carried forward from the previous
      run to prevent a false "new VIN" flood on recovery)
-  1  hard failure (no dealers reachable, or notification send failed)
+  1  hard failure: no dealers reachable, notification send failed, corrupt
+     state file, missing-state-without-bootstrap, or a safety guard tripped
+     (oversized new-listings batch, or bootstrap that would wipe existing
+     state). Tripped guards can be overridden with `--force` after manual
+     investigation.
 """
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import random
 import sys
@@ -33,6 +38,11 @@ DEALER_GAP_SECONDS = 10
 # Random jitter at start of run to avoid clustering exactly on :00/:15/:30/:45 with
 # every other GitHub Actions cron job in the world.
 MAX_JITTER_SECONDS = 30
+# Safety cap on "new VINs in one run". CPO inventory turns over slowly; a normal
+# day sees <10 new listings across all 5 dealers. Anything over this is a strong
+# signal that something is wrong (dealer platform migration, swapped inventory,
+# scope-of-filter regression). Override with --force after investigating.
+MAX_NEW_LISTINGS_PER_RUN = 50
 
 
 def parse_args() -> argparse.Namespace:
@@ -41,6 +51,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-jitter", action="store_true", help="skip startup jitter (useful in tests)")
     p.add_argument("--dry-run", action="store_true", help="don't write state, don't send email")
     p.add_argument("--bootstrap", action="store_true", help="treat all current listings as already-seen (no email)")
+    p.add_argument("--force", action="store_true",
+                   help="override safety guards: allow bootstrap to overwrite existing state, "
+                        "or allow an email exceeding MAX_NEW_LISTINGS_PER_RUN. Use only after "
+                        "investigating why the guard tripped.")
     return p.parse_args()
 
 
@@ -87,8 +101,34 @@ def main() -> int:
         log.info("startup jitter: sleeping %.1fs", jitter)
         time.sleep(jitter)
 
-    prev = state.load(args.state_root)
+    try:
+        prev = state.load(args.state_root)
+    except (json.JSONDecodeError, OSError) as e:
+        # Corrupt / unreadable state file. Bail out loudly so the user notices and
+        # investigates — silently treating it as "no state" would re-flag every
+        # current VIN as new on the next run and trigger a flood email.
+        print(f"::error::state file unreadable ({type(e).__name__}): {e}. "
+              "Inspect the watch-state branch manually before re-running.")
+        return 1
     log.info("loaded prev state: %d vins", len(prev))
+
+    # Guard: empty prev state in non-bootstrap mode means either the very first
+    # scheduled run on a fresh repo, or something cleared the state. Either way,
+    # proceeding would flag every current VIN as new. Force the operator to opt in
+    # via `--bootstrap` (which records the snapshot without emailing).
+    if not args.bootstrap and not prev:
+        print("::error::state is empty but --bootstrap is not set. "
+              "Run the workflow once with bootstrap=true to record the initial "
+              "snapshot, then let the schedule take over.")
+        return 1
+
+    # Guard: bootstrap mode with a non-empty existing state would silently reset
+    # every VIN's `first_seen` timestamp. Require --force to override.
+    if args.bootstrap and prev and not args.force:
+        print(f"::error::--bootstrap requested but state already contains {len(prev)} VINs. "
+              "Re-running bootstrap would reset every `first_seen` timestamp. "
+              "Pass --force (workflow input `force=true`) if that's intentional.")
+        return 1
 
     session = requests.Session()
     current, failed = fetch_all(session)
@@ -125,6 +165,20 @@ def main() -> int:
         log.info("dry-run: would save %d vins, would email new=%d drops=%d",
                  len(next_state), len(new_listings), len(price_drops))
         return 0
+
+    # Guard: oversized "new" batch is almost always a symptom (platform migration,
+    # filter regression, swapped inventory) rather than 50+ genuinely new cars
+    # showing up in 15 minutes. Bail without saving so the operator can investigate
+    # and either confirm with --force or fix the underlying issue.
+    if len(new_listings) > MAX_NEW_LISTINGS_PER_RUN and not args.force:
+        per_dealer = {}
+        for l in new_listings:
+            per_dealer[l.get("dealer_key") or "?"] = per_dealer.get(l.get("dealer_key") or "?", 0) + 1
+        print(f"::error::{len(new_listings)} new listings exceeds safety cap "
+              f"({MAX_NEW_LISTINGS_PER_RUN}). per-dealer: {per_dealer}. "
+              "This usually indicates an inventory swap or filter regression. "
+              "Investigate, then re-run with force=true to send the email.")
+        return 1
 
     # Email first; only persist state if the email was either sent successfully or
     # there was nothing to send. If SMTP fails we exit 1 *without* saving so the

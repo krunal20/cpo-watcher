@@ -14,16 +14,15 @@ STATE_FILE = "state.json"
 
 
 def load(state_root: Path) -> dict:
+    """Load state.json. Raises on read/parse errors so the caller can fail loud
+    rather than silently treating a corrupt file as "no state" (which would
+    re-flag every current VIN as new on the next run)."""
     path = state_root / STATE_FILE
     if not path.exists():
         log.info("state file missing at %s; starting empty", path)
         return {}
-    try:
-        with path.open() as f:
-            return json.load(f)
-    except (OSError, json.JSONDecodeError) as e:
-        log.error("failed to load state from %s: %r; starting empty", path, e)
-        return {}
+    with path.open() as f:
+        return json.load(f)
 
 
 def save(state_root: Path, state: dict) -> None:

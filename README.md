@@ -21,11 +21,20 @@ Runs entirely on GitHub Actions cron. State is persisted on a separate `watch-st
 
 ### 2. Bootstrap the inventory snapshot
 
-The very first poll will see every current listing as "new" and try to email all of them. To avoid that, run the workflow once manually in **bootstrap mode** before letting the cron take over:
+The very first scheduled run **will refuse to run** if `state.json` is empty — that's a safety guard against emailing 250+ "new" listings on cold start. Run the workflow once manually in bootstrap mode first:
 
 `Actions → cpo-watch → Run workflow → set "bootstrap" to true → Run`.
 
-That run records every current VIN to `state.json` without sending any email. From then on, the scheduled cron sends alerts only for genuine changes.
+That run records every current VIN to `state.json` without sending any email. After it completes the scheduled cron takes over and emails only on genuine changes.
+
+## Safety guards
+
+The watcher hard-fails (exit 1) rather than risk an alert flood when any of these tripwires fire:
+
+- **State file is empty in non-bootstrap mode** — usually means bootstrap hasn't been run yet (or state was reset). Run bootstrap.
+- **State file is corrupt / unreadable** — won't silently fall back to "no state" (which would mass-alert). Inspect the `watch-state` branch and fix manually.
+- **Bootstrap requested with non-empty state** — would reset every `first_seen` timestamp. Pass `force=true` if intentional.
+- **More than `MAX_NEW_LISTINGS_PER_RUN` (50) new VINs in one cycle** — usually means an API change or inventory swap, not 50 genuinely new cars in 15 minutes. The error log includes a per-dealer breakdown. Investigate first, then re-run with `force=true` to send the email.
 
 ## How it works
 
