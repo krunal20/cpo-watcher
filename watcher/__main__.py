@@ -26,7 +26,7 @@ from pathlib import Path
 
 import requests
 
-from watcher import diff, notify, state
+from watcher import diff, filters, notify, state
 from watcher.dealers import DEALERS
 from watcher.fetchers import fetch_with_retry
 
@@ -142,6 +142,14 @@ def main() -> int:
     if not current:
         print("::error::all dealers failed; not touching state, not sending email")
         return 1
+
+    # Apply user filters (see watcher/filters.py for the active criteria).
+    # Filtering at fetch boundary keeps state.json scoped to just the listings
+    # the user actually wants alerts about. The carry-forward set is filtered
+    # too: a non-matching VIN that was previously tracked falls off naturally.
+    pre_filter = len(current)
+    current = [l for l in current if filters.matches(l)]
+    log.info("after filters: %d matching (filtered out %d)", len(current), pre_filter - len(current))
 
     if args.bootstrap:
         _, _, next_state = diff.compute({}, current)
