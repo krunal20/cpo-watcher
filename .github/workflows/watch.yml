@@ -32,7 +32,12 @@ permissions:
 jobs:
   watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    # Stay well under the 15-min cron interval. GitHub Actions concurrency keeps at
+    # most one queued run per group, so a run that exceeds the interval causes the
+    # next scheduled tick to be cancelled. Capping at 7 min leaves headroom for
+    # jitter (up to 30s) + 5 dealers * up to ~90s with retries ≈ 8 min worst case
+    # — and the timeout will kill anything stuck so we don't drop multiple ticks.
+    timeout-minutes: 7
     env:
       SMTP_HOST: smtp.gmail.com
       SMTP_PORT: '587'
@@ -65,10 +70,26 @@ jobs:
       - run: pip install -r code/requirements.txt
 
       - name: Mask sensitive env
+        # secrets.* are auto-masked by GitHub already; these calls are
+        # belt-and-braces in case any value gets re-derived later.
         run: |
           [ -n "$ALERT_TO" ] && echo "::add-mask::$ALERT_TO" || true
           [ -n "$SMTP_USER" ] && echo "::add-mask::$SMTP_USER" || true
           [ -n "$SMTP_PASS" ] && echo "::add-mask::$SMTP_PASS" || true
+
+      - name: Verify required secrets
+        # Fail fast if a secret is unset. Without this, every 15-min cron tick
+        # would hit the dealer APIs only to discover at the end there's nowhere
+        # to email — wasteful and impolite to the dealers.
+        run: |
+          missing=()
+          [ -z "$SMTP_USER" ] && missing+=("GMAIL_USERNAME")
+          [ -z "$SMTP_PASS" ] && missing+=("GMAIL_APP_PASSWORD")
+          [ -z "$ALERT_TO" ]  && missing+=("ALERT_RECIPIENT")
+          if [ ${#missing[@]} -ne 0 ]; then
+            echo "::error::missing repository secret(s): ${missing[*]}. Set them at Settings → Secrets and variables → Actions."
+            exit 1
+          fi
 
       - name: Run watcher
         id: run
@@ -88,9 +109,11 @@ jobs:
           rm -f -- *.json.tmp *.tmp
           # Back up the freshly-written state outside the working tree so we can
           # restore it after a destructive `git reset --hard` during rebase retries.
+          # Set the cleanup trap BEFORE cp so a cp failure doesn't leak the tmp file
+          # (set -e would abort before a later trap could be registered).
           STATE_BACKUP=$(mktemp)
-          cp state.json "$STATE_BACKUP"
           trap 'rm -f "$STATE_BACKUP"' EXIT
+          cp state.json "$STATE_BACKUP"
           git add -A
           if git diff --cached --quiet; then
             echo "no state change"

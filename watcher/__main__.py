@@ -8,11 +8,11 @@ Exit codes:
      ::warning:: annotation, but the run stays green because state was correctly
      persisted with the failed dealers' VINs carried forward from the previous
      run to prevent a false "new VIN" flood on recovery)
-  1  hard failure: no dealers reachable, notification send failed, corrupt
-     state file, missing-state-without-bootstrap, or a safety guard tripped
-     (oversized new-listings batch, or bootstrap that would wipe existing
-     state). Tripped guards can be overridden with `--force` after manual
-     investigation.
+  1  hard failure: no dealers reachable, notification send failed, corrupt /
+     wrong-shape state file, or a safety guard tripped (oversized new-listings
+     or price-drops batch, bootstrap that would wipe existing state, or first
+     run with partial dealer failure). Tripped guards can be overridden with
+     `--force` after manual investigation.
 """
 from __future__ import annotations
 
@@ -43,6 +43,10 @@ MAX_JITTER_SECONDS = 30
 # signal that something is wrong (dealer platform migration, swapped inventory,
 # scope-of-filter regression). Override with --force after investigating.
 MAX_NEW_LISTINGS_PER_RUN = 50
+# Same idea for price-drops: a single dealer flipping pricing fields (e.g. swapping
+# from internetPrice to salePrice) can produce dozens of phantom drops in one cycle.
+# Cap separately because new-listing storms and drop storms have different root causes.
+MAX_PRICE_DROPS_PER_RUN = 30
 
 
 def parse_args() -> argparse.Namespace:
@@ -103,24 +107,19 @@ def main() -> int:
 
     try:
         prev = state.load(args.state_root)
-    except (json.JSONDecodeError, OSError) as e:
-        # Corrupt / unreadable state file. Bail out loudly so the user notices and
-        # investigates — silently treating it as "no state" would re-flag every
-        # current VIN as new on the next run and trigger a flood email.
+    except (json.JSONDecodeError, OSError, ValueError) as e:
+        # Corrupt / unreadable / wrong-shape state file. Bail out loudly so the
+        # user notices and investigates — silently treating it as "no state"
+        # would re-flag every current VIN as new and trigger a flood email.
         print(f"::error::state file unreadable ({type(e).__name__}): {e}. "
               "Inspect the watch-state branch manually before re-running.")
         return 1
     log.info("loaded prev state: %d vins", len(prev))
 
-    # Guard: empty prev state in non-bootstrap mode means either the very first
-    # scheduled run on a fresh repo, or something cleared the state. Either way,
-    # proceeding would flag every current VIN as new. Force the operator to opt in
-    # via `--bootstrap` (which records the snapshot without emailing).
-    if not args.bootstrap and not prev:
-        print("::error::state is empty but --bootstrap is not set. "
-              "Run the workflow once with bootstrap=true to record the initial "
-              "snapshot, then let the schedule take over.")
-        return 1
+    # Note: empty prev state in non-bootstrap mode is allowed. On first run (or
+    # after adding a new dealer in dealers.py), every matching VIN is "new" and
+    # will be emailed. The MAX_NEW_LISTINGS_PER_RUN guard below still catches a
+    # genuine flood. `--bootstrap` remains an opt-in for silent snapshotting.
 
     # Guard: bootstrap mode with a non-empty existing state would silently reset
     # every VIN's `first_seen` timestamp. Require --force to override.
@@ -151,6 +150,57 @@ def main() -> int:
     current = [l for l in current if filters.matches(l)]
     log.info("after filters: %d matching (filtered out %d)", len(current), pre_filter - len(current))
 
+    # Guard: first run (empty prev) with any dealer failure in non-bootstrap mode
+    # would baseline state to only the succeeding dealers — guaranteeing that when
+    # the failed dealers recover, every matching VIN on them shows up as "new" and
+    # floods the email (or trips the MAX cap, requiring repeated --force). Skip in
+    # bootstrap mode since that path is explicit "snapshot whatever you fetched".
+    if not prev and failed and not args.bootstrap and not args.force:
+        print(f"::error::first run (empty state) but {len(failed)} dealer(s) failed: "
+              f"{sorted(failed)}. Baselining on a partial fetch would cause a false-alert "
+              "flood when the failed dealer(s) recover. Investigate the dealer error(s) "
+              "above, then re-run with force=true (or use bootstrap=true to silently "
+              "snapshot the partial state).")
+        return 1
+
+    new_listings, price_drops, next_state = diff.compute(prev, current)
+    carried = carry_forward_failed(prev, next_state, failed)
+    if carried:
+        log.info("carried %d prev VINs forward for failed dealers", carried)
+    log.info("diff: new=%d price_drops=%d", len(new_listings), len(price_drops))
+
+    # Guards: oversized "new" or "drop" batches are almost always symptoms (platform
+    # migration, filter regression, swapped inventory, pricing-field flip) rather
+    # than that many genuine changes in 15 minutes. We check these BEFORE the
+    # dry-run branch so dry-runs accurately reflect what a real run would do, and
+    # BEFORE bootstrap so a misconfigured bootstrap can't silently snapshot garbage.
+    if not args.force:
+        if args.bootstrap:
+            # In bootstrap mode the "new" count is effectively len(current) since
+            # prev is treated as empty for the diff. Check against the cap.
+            if len(current) > MAX_NEW_LISTINGS_PER_RUN:
+                per_dealer = _per_dealer_count(current)
+                print(f"::error::bootstrap would snapshot {len(current)} listings, exceeding "
+                      f"safety cap ({MAX_NEW_LISTINGS_PER_RUN}). per-dealer: {per_dealer}. "
+                      "This usually indicates a misconfigured filter or dealer entry. "
+                      "Investigate, then re-run with force=true to override.")
+                return 1
+        else:
+            if len(new_listings) > MAX_NEW_LISTINGS_PER_RUN:
+                per_dealer = _per_dealer_count(new_listings)
+                print(f"::error::{len(new_listings)} new listings exceeds safety cap "
+                      f"({MAX_NEW_LISTINGS_PER_RUN}). per-dealer: {per_dealer}. "
+                      "This usually indicates an inventory swap or filter regression. "
+                      "Investigate, then re-run with force=true to send the email.")
+                return 1
+            if len(price_drops) > MAX_PRICE_DROPS_PER_RUN:
+                per_dealer = _per_dealer_count(l for l, _ in price_drops)
+                print(f"::error::{len(price_drops)} price drops exceeds safety cap "
+                      f"({MAX_PRICE_DROPS_PER_RUN}). per-dealer: {per_dealer}. "
+                      "This usually indicates a pricing-field flip on a dealer, not real "
+                      "drops. Investigate, then re-run with force=true to send the email.")
+                return 1
+
     if args.bootstrap:
         _, _, next_state = diff.compute({}, current)
         carried = carry_forward_failed(prev, next_state, failed)
@@ -163,30 +213,10 @@ def main() -> int:
         state.save(args.state_root, next_state)
         return 0
 
-    new_listings, price_drops, next_state = diff.compute(prev, current)
-    carried = carry_forward_failed(prev, next_state, failed)
-    if carried:
-        log.info("carried %d prev VINs forward for failed dealers", carried)
-    log.info("diff: new=%d price_drops=%d", len(new_listings), len(price_drops))
-
     if args.dry_run:
         log.info("dry-run: would save %d vins, would email new=%d drops=%d",
                  len(next_state), len(new_listings), len(price_drops))
         return 0
-
-    # Guard: oversized "new" batch is almost always a symptom (platform migration,
-    # filter regression, swapped inventory) rather than 50+ genuinely new cars
-    # showing up in 15 minutes. Bail without saving so the operator can investigate
-    # and either confirm with --force or fix the underlying issue.
-    if len(new_listings) > MAX_NEW_LISTINGS_PER_RUN and not args.force:
-        per_dealer = {}
-        for l in new_listings:
-            per_dealer[l.get("dealer_key") or "?"] = per_dealer.get(l.get("dealer_key") or "?", 0) + 1
-        print(f"::error::{len(new_listings)} new listings exceeds safety cap "
-              f"({MAX_NEW_LISTINGS_PER_RUN}). per-dealer: {per_dealer}. "
-              "This usually indicates an inventory swap or filter regression. "
-              "Investigate, then re-run with force=true to send the email.")
-        return 1
 
     # Email first; only persist state if the email was either sent successfully or
     # there was nothing to send. If SMTP fails we exit 1 *without* saving so the
@@ -199,6 +229,14 @@ def main() -> int:
 
     state.save(args.state_root, next_state)
     return 0
+
+
+def _per_dealer_count(listings) -> dict:
+    out: dict[str, int] = {}
+    for l in listings:
+        k = l.get("dealer_key") or "?"
+        out[k] = out.get(k, 0) + 1
+    return out
 
 
 if __name__ == "__main__":

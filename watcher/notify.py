@@ -61,7 +61,9 @@ STAT_FIELDS: list[tuple[str, str]] = [
 
 # ───────────────────────────── Formatters ─────────────────────────────
 def _fmt_price(p: int | None) -> str:
-    return f"${p:,}" if p else "—"
+    # `is not None` (not truthiness) so a price of exactly 0 — were sanitization
+    # boundaries ever relaxed — renders as "$0" rather than "—".
+    return f"${p:,}" if p is not None else "—"
 
 
 def _fmt_miles(m: int | None) -> str:
@@ -226,7 +228,10 @@ def _build_html(new_listings: list[dict], price_drops: list[tuple[dict, int]]) -
 # ───────────────────────────── Text render ─────────────────────────────
 def _card_text(listing: dict, was_price: int | None = None) -> list[str]:
     lines = [_fmt_title(listing), _fmt_price(listing.get("price"))]
-    if was_price and (p := listing.get("price")) and p < was_price:
+    # Match the HTML version's `is not None` semantics so the two render paths
+    # don't diverge on a $0-edge listing.
+    p = listing.get("price")
+    if was_price is not None and p is not None and p < was_price:
         lines.append(f"  (was {_fmt_price(was_price)} · −{_fmt_price(was_price - p)})")
     for label, key in STAT_FIELDS:
         lines.append(f"  {label}: {_fmt_stat(key, listing)}")
@@ -269,16 +274,28 @@ def send(
     smtp_pass = smtp_pass or os.environ.get("SMTP_PASS")
     recipient = recipient or os.environ.get("ALERT_TO")
 
-    if not (smtp_user and smtp_pass and recipient):
-        log.error("missing SMTP credentials or recipient; skipping email")
+    missing = [name for name, val in (
+        ("GMAIL_USERNAME (SMTP_USER)", smtp_user),
+        ("GMAIL_APP_PASSWORD (SMTP_PASS)", smtp_pass),
+        ("ALERT_RECIPIENT (ALERT_TO)", recipient),
+    ) if not val]
+    if missing:
+        # ::error:: surfaces this on the GitHub Actions run summary so the user
+        # immediately knows which secret to set, rather than seeing a vague red X
+        # and digging through INFO logs.
+        print(f"::error::missing required secret(s): {', '.join(missing)}. "
+              "Set them at Settings → Secrets and variables → Actions and re-run.")
         return False
 
+    # Use the sender's domain in Message-ID rather than .local (mDNS-reserved,
+    # which some spam filters penalize).
+    msgid_domain = smtp_user.split("@", 1)[1] if "@" in smtp_user else "cpo-watcher"
     msg = EmailMessage()
     msg["From"] = f"cpo-watcher <{smtp_user}>"
     msg["To"] = recipient
     msg["Subject"] = SUBJECT
     msg["Date"] = formatdate(localtime=True)
-    msg["Message-ID"] = make_msgid(domain="cpo-watcher.local")
+    msg["Message-ID"] = make_msgid(domain=msgid_domain)
     msg.set_content(_build_text(new_listings, price_drops))
     msg.add_alternative(_build_html(new_listings, price_drops), subtype="html")
 

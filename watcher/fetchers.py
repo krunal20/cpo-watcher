@@ -115,7 +115,10 @@ def _normalize_dealeron(vc: dict, dealer: dict) -> dict:
         price_int = _digits(vc.get("TaggingPrice"))
     return {
         "vin": vc.get("VehicleVin"),
-        "year": vc.get("VehicleYear"),
+        # year is documented int|None on the unified shape; coerce defensively
+        # in case the API returns "2024" (string) or "" (empty) — comparison
+        # against int MIN_YEAR in filters.py would crash with TypeError otherwise.
+        "year": _digits(vc.get("VehicleYear")),
         "make": vc.get("VehicleMake"),
         "model": vc.get("VehicleModel"),
         "trim": vc.get("VehicleTrim") or "",
@@ -225,7 +228,8 @@ def _normalize_dealercom(it: dict, dealer: dict) -> dict:
         vdp_link = f"https://{dealer['host']}{vdp_link}"
     return {
         "vin": it.get("vin") or attrs.get("vin"),
-        "year": it.get("year"),
+        # Defensive int-coerce: see VehicleYear comment in _normalize_dealeron.
+        "year": _digits(it.get("year")),
         "make": it.get("make"),
         "model": it.get("model"),
         "trim": it.get("trim") or "",
@@ -247,22 +251,57 @@ FETCHERS = {
 }
 
 
+# Max we'll honor from a Retry-After header. Beyond this, the dealer is asking us
+# to back off longer than this 15-min cron tick will tolerate — better to give up
+# and try fresh next cycle than to hold a runner open.
+MAX_RETRY_AFTER_SECONDS = 60
+# Non-retryable HTTP codes: dealer config wrong, endpoint moved, forbidden, etc.
+# These won't resolve within seconds, so retrying just produces impolite traffic.
+NON_RETRYABLE_STATUS = {400, 401, 403, 404, 410}
+
+
 def fetch_with_retry(dealer: dict, session: requests.Session, max_attempts: int = 3) -> list[dict]:
     """Fetch one dealer with retry/backoff. Returns [] on permanent failure (logged)."""
     fetcher = FETCHERS[dealer["platform"]]
     for attempt in range(1, max_attempts + 1):
+        backoff = 5 * attempt
         try:
             listings = fetcher(dealer, session)
-            # VINs are required; drop entries without one
-            listings = [l for l in listings if l.get("vin")]
-            log.info("dealer=%s ok count=%d", dealer["key"], len(listings))
-            return listings
+            # VINs are required; drop entries without one. Also dedupe by VIN
+            # keeping the first occurrence — DealerOn pagination occasionally
+            # returns a VIN twice when inventory shifts mid-paginate, and a
+            # duplicate VIN downstream inflates new_listings and the safety cap.
+            seen: set[str] = set()
+            unique: list[dict] = []
+            for l in listings:
+                vin = l.get("vin")
+                if not vin or vin in seen:
+                    continue
+                seen.add(vin)
+                unique.append(l)
+            dropped = len(listings) - len(unique)
+            log.info("dealer=%s ok count=%d%s", dealer["key"], len(unique),
+                     f" (dropped {dropped} dup/no-vin)" if dropped else "")
+            return unique
         except requests.HTTPError as e:
-            status = e.response.status_code if e.response is not None else "?"
-            log.warning("dealer=%s http_error status=%s attempt=%d/%d", dealer["key"], status, attempt, max_attempts)
+            resp = e.response
+            status = resp.status_code if resp is not None else "?"
+            log.warning("dealer=%s http_error status=%s attempt=%d/%d",
+                        dealer["key"], status, attempt, max_attempts)
+            if isinstance(status, int) and status in NON_RETRYABLE_STATUS:
+                log.error("dealer=%s non-retryable status %s; giving up", dealer["key"], status)
+                return []
+            # Honor Retry-After (seconds form only; HTTP-date form ignored). Cap to
+            # MAX_RETRY_AFTER_SECONDS so the runner doesn't hang on a hostile server.
+            if resp is not None:
+                ra = resp.headers.get("Retry-After")
+                if ra and ra.isdigit():
+                    backoff = min(int(ra), MAX_RETRY_AFTER_SECONDS)
+                    log.info("dealer=%s honoring Retry-After=%ss", dealer["key"], backoff)
         except Exception as e:
-            log.warning("dealer=%s error=%r attempt=%d/%d", dealer["key"], e, attempt, max_attempts)
+            log.warning("dealer=%s error=%s: %s attempt=%d/%d",
+                        dealer["key"], type(e).__name__, e, attempt, max_attempts)
         if attempt < max_attempts:
-            time.sleep(5 * attempt)
+            time.sleep(backoff)
     log.error("dealer=%s failed after %d attempts; returning empty list", dealer["key"], max_attempts)
     return []

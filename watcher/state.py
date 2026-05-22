@@ -14,15 +14,26 @@ STATE_FILE = "state.json"
 
 
 def load(state_root: Path) -> dict:
-    """Load state.json. Raises on read/parse errors so the caller can fail loud
-    rather than silently treating a corrupt file as "no state" (which would
-    re-flag every current VIN as new on the next run)."""
+    """Load state.json. Raises on read/parse/shape errors so the caller can fail
+    loud rather than silently treating a bad file as "no state" (which would
+    re-flag every current VIN as new on the next run).
+
+    Raises:
+        OSError: file read error.
+        json.JSONDecodeError: malformed JSON.
+        ValueError: JSON parses but isn't the expected {vin: {...}} dict shape.
+    """
     path = state_root / STATE_FILE
     if not path.exists():
         log.info("state file missing at %s; starting empty", path)
         return {}
     with path.open() as f:
-        return json.load(f)
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"state.json has wrong shape: expected dict, got {type(data).__name__}"
+        )
+    return data
 
 
 def save(state_root: Path, state: dict) -> None:
