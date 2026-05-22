@@ -19,13 +19,16 @@ MIN_YEAR: int | None = 2024
 # missing/None are also skipped — better to under-alert than to surprise on
 # unknown-mileage records.
 MAX_MILEAGE: int | None = 25_000
-# Exact model match, case-insensitive. Toyota's API returns canonical model
-# names ("Camry", "RAV4", "Tacoma") so exact match is reliable.
+# Model name, case-insensitive. Matches the bare name OR the name followed by a
+# powertrain qualifier — so MODEL="Camry" matches both "Camry" and "Camry Hybrid"
+# (Toyota's API uses both forms inconsistently across dealers). It does NOT match
+# unrelated models that happen to share a prefix (e.g. a hypothetical "Camrylike"
+# wouldn't match because the next char after "Camry" must be whitespace).
 MODEL: str | None = "Camry"
-# Exact trim match, case-insensitive. Some dealers append qualifiers to trim
-# (e.g. "LE Sedan FWD"), but the inventory APIs themselves return the clean
-# trim string ("LE"). If a dealer ever returns a verbose trim, switch to
-# substring match (see commented-out alternative in `matches()`).
+# Trim, case-insensitive, matched as a whitespace-separated token. So TRIM="LE"
+# matches "LE", "LE Hybrid", "LE Sedan FWD", and Earnhardt's marketing-suffixed
+# "LE *1-OWNER*" — but correctly rejects "XLE", "SE", or any trim where LE is a
+# substring rather than a standalone word.
 TRIM: str | None = "LE"
 
 
@@ -44,14 +47,16 @@ def matches(listing: dict) -> bool:
 
     if MODEL is not None:
         model = (listing.get("model") or "").strip().lower()
-        if model != MODEL.strip().lower():
+        target = MODEL.strip().lower()
+        # Either an exact match ("Camry") or the model with a trailing qualifier
+        # like "Camry Hybrid". Requires whitespace after the target to avoid
+        # spurious prefix matches.
+        if model != target and not model.startswith(target + " "):
             return False
 
     if TRIM is not None:
-        trim = (listing.get("trim") or "").strip().lower()
-        if trim != TRIM.strip().lower():
-            # Alternative if a dealer ever returns verbose trim:
-            #   if TRIM.lower() not in trim:
+        trim_tokens = (listing.get("trim") or "").lower().split()
+        if TRIM.strip().lower() not in trim_tokens:
             return False
 
     return True
