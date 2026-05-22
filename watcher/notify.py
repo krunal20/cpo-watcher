@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 import os
 import smtplib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 from html import escape
@@ -29,6 +29,11 @@ log = logging.getLogger(__name__)
 
 # ─────────────────────────── Brand / theme ───────────────────────────
 SUBJECT = "Certified Pre-Owned Camry Alert!"
+
+# Arizona uses Mountain Standard Time year-round (no DST in the Phoenix metro
+# where all 5 dealers live), so a fixed UTC-7 offset is always correct. Using a
+# fixed offset avoids needing the `tzdata` package on Windows for `zoneinfo`.
+ARIZONA = timezone(timedelta(hours=-7), name="MST")
 
 # Inline-CSS palette. Email clients (especially Outlook) don't support CSS
 # variables or stylesheets, so these get duplicated into every style="" below.
@@ -152,7 +157,12 @@ def _section_html(heading: str, count: int, cards_html: str) -> str:
 
 
 def _build_html(new_listings: list[dict], price_drops: list[tuple[dict, int]]) -> str:
-    ts = datetime.now(timezone.utc).strftime("%b %d, %Y · %H:%M UTC")
+    # 12-hour clock with no leading zero on the hour ("7:29 AM" not "07:29 AM").
+    # strftime("%-I"/"%#I") differs across Unix/Windows, so we format manually.
+    now_az = datetime.now(ARIZONA)
+    hour_12 = now_az.hour % 12 or 12
+    am_pm = "AM" if now_az.hour < 12 else "PM"
+    ts = now_az.strftime(f"%b %d, %Y · {hour_12}:%M {am_pm} AZ")
 
     parts = []
     if new_listings:
