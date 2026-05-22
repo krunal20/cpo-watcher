@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.env
+*.network-request
+*.network-response
+.DS_Store
+.idea/
+.vscode/
